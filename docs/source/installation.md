@@ -1,12 +1,13 @@
 # Installation
 
 ## Dependencies
-| Requirement  | Supported version | Recommended version | Note |
-| ------------ | ------- | ----------- | ----------- | 
-| Python | >= 3.9 | [3.10](https://www.python.org/downloads/) | Required for vllm |
-| CANN         | >= 8.0.RC2 | [8.0.RC3](https://www.hiascend.com/developer/download/community/result?module=cann&cann=8.0.0.beta1) | Required for vllm-ascend and torch-npu |
-| torch-npu    | >= 2.4.0   | [2.5.1rc1](https://gitee.com/ascend/pytorch/releases/tag/v6.0.0.alpha001-pytorch2.5.1)    | Required for vllm-ascend |
-| torch        | >= 2.4.0   | [2.5.1](https://github.com/pytorch/pytorch/releases/tag/v2.5.1)      | Required for torch-npu and vllm required |
+
+| Requirement | Supported version |                                         Recommended version                                          |                   Note                   |
+| ----------- | ----------------- | ---------------------------------------------------------------------------------------------------- | ---------------------------------------- |
+| Python      | >= 3.9            | [3.10](https://www.python.org/downloads/)                                                            | Required for vllm                        |
+| CANN        | >= 8.0.RC2        | [8.0.RC3](https://www.hiascend.com/developer/download/community/result?module=cann&cann=8.0.0.beta1) | Required for vllm-ascend and torch-npu   |
+| torch-npu   | >= 2.4.0          | [2.5.1rc1](https://gitee.com/ascend/pytorch/releases/tag/v6.0.0.alpha001-pytorch2.5.1)               | Required for vllm-ascend                 |
+| torch       | >= 2.4.0          | [2.5.1](https://github.com/pytorch/pytorch/releases/tag/v2.5.1)                                      | Required for torch-npu and vllm required |
 
 ## Prepare Ascend NPU environment
 
@@ -48,6 +49,7 @@ pip install -e .
 ```
 
 ### Build container image from source
+
 ```bash
 git clone https://github.com/vllm-project/vllm-ascend.git
 cd vllm-ascend

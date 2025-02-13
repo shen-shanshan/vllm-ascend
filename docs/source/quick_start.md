@@ -3,6 +3,7 @@
 ## Prerequisites
 
 ### Supported Devices
+
 - Atlas A2 Training series (Atlas 800T A2, Atlas 900 A2 PoD, Atlas 200T A2 Box16, Atlas 300T A2)
 - Atlas 800I A2 Inference series (Atlas 800I A2)
 
@@ -47,7 +48,6 @@ You will see following message:
 +======================+===============+====================================================+
 ```
 
-
 ## Installation
 
 Prepare:
@@ -82,7 +82,6 @@ cd vllm-ascend
 pip install -e .
 cd ..
 ```
-
 
 ## Usage
 
@@ -144,6 +143,7 @@ INFO:     Waiting for application startup.
 INFO:     Application startup complete.
 INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
 ```
+
 Congratulations, you have successfully started the vLLM server!
 
 You can query the list the models:
@@ -175,6 +175,7 @@ kill -2 $VLLM_PID
 ```
 
 You will see output as below:
+
 ```
 INFO 02-12 03:34:10 launcher.py:59] Shutting down FastAPI HTTP server.
 INFO:     Shutting down
