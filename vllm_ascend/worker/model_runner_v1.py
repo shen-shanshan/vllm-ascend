@@ -362,6 +362,9 @@ class NPUModelRunner(GPUModelRunner):
         self.reorder_batch_threshold: int | None = None
         self.long_seq_metadata = None
 
+        self.step_cnt = 0
+        self.non_torch_memory = 0
+
     def _init_device_properties(self) -> None:
         self.num_sms = None
 
@@ -768,8 +771,39 @@ class NPUModelRunner(GPUModelRunner):
                     scheduler_output,
                     encoder_cache=self.encoder_cache,
             ):
+                ################################################################
+                # from vllm.utils.mem_constants import GiB_bytes
+                # GiB = lambda b: b / GiB_bytes
+
+                # if torch.distributed.get_rank() == 0:
+                #     torch_memory = torch.npu.memory_reserved()
+                #     free_memory, total_memory = torch.npu.mem_get_info()
+                #     non_torch_memory = total_memory - free_memory - torch_memory
+
+                #     if non_torch_memory > self.non_torch_memory:
+                #         self.non_torch_memory = non_torch_memory
+                #         print("-" * 100)
+                #         logger.info("before _execute_mm_encoder:")
+                #         logger.info("non_torch_memory: %.2f G", GiB(non_torch_memory))
+                #         print("-" * 100)
+                ################################################################
+
                 # Run the multimodal encoder if any.
                 self._execute_mm_encoder(scheduler_output)
+
+                ################################################################
+                # if torch.distributed.get_rank() == 0:
+                #     torch_memory = torch.npu.memory_reserved()
+                #     free_memory, total_memory = torch.npu.mem_get_info()
+                #     non_torch_memory = total_memory - free_memory - torch_memory
+
+                #     if non_torch_memory > self.non_torch_memory:
+                #         self.non_torch_memory = non_torch_memory
+                #         print("-" * 100)
+                #         logger.info("after _execute_mm_encoder:")
+                #         logger.info("non_torch_memory: %.2f G", GiB(non_torch_memory))
+                #         print("-" * 100)
+                ################################################################
 
                 # NOTE(woosuk): To unify token ids and soft tokens (vision
                 # embeddings), we always use embeddings (rather than token ids)
@@ -778,17 +812,59 @@ class NPUModelRunner(GPUModelRunner):
                 mm_embeds, is_mm_embed = self._gather_mm_embeddings(
                     scheduler_output)
 
+                ################################################################
+                # if torch.distributed.get_rank() == 0:
+                #     torch_memory = torch.npu.memory_reserved()
+                #     free_memory, total_memory = torch.npu.mem_get_info()
+                #     non_torch_memory = total_memory - free_memory - torch_memory
+
+                #     if non_torch_memory > self.non_torch_memory:
+                #         self.non_torch_memory = non_torch_memory
+                #         print("-" * 100)
+                #         logger.info("after _gather_mm_embeddings:")
+                #         logger.info("non_torch_memory: %.2f G", GiB(non_torch_memory))
+                #         print("-" * 100)
+                ################################################################
+
             inputs_embeds = self.model.embed_input_ids(
                 input_ids,
                 multimodal_embeddings=mm_embeds,
                 is_multimodal=is_mm_embed,
             )
 
+            ################################################################
+            # if torch.distributed.get_rank() == 0:
+            #     torch_memory = torch.npu.memory_reserved()
+            #     free_memory, total_memory = torch.npu.mem_get_info()
+            #     non_torch_memory = total_memory - free_memory - torch_memory
+
+            #     if non_torch_memory > self.non_torch_memory:
+            #         self.non_torch_memory = non_torch_memory
+            #         print("-" * 100)
+            #         logger.info("after embed_input_ids:")
+            #         logger.info("non_torch_memory: %.2f G", GiB(non_torch_memory))
+            #         print("-" * 100)
+            ################################################################
+
             # TODO(woosuk): Avoid the copy. Optimize.
             self.inputs_embeds.gpu[:total_num_scheduled_tokens].copy_(
                 inputs_embeds)
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
             input_ids = None
+
+            ################################################################
+            # if torch.distributed.get_rank() == 0:
+            #     torch_memory = torch.npu.memory_reserved()
+            #     free_memory, total_memory = torch.npu.mem_get_info()
+            #     non_torch_memory = total_memory - free_memory - torch_memory
+
+            #     if non_torch_memory > self.non_torch_memory:
+            #         self.non_torch_memory = non_torch_memory
+            #         print("-" * 100)
+            #         logger.info("after copy:")
+            #         logger.info("non_torch_memory: %.2f G", GiB(non_torch_memory))
+            #         print("-" * 100)
+            ################################################################
         elif self.enable_prompt_embeds and get_pp_group().is_first_rank:
             # Get the input embeddings for the tokens that are not input embeds,
             # then put them into the appropriate positions.
@@ -1432,6 +1508,30 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors] | None:
+        self.step_cnt += 1
+        ########################################################################
+        # from vllm.utils.mem_constants import GiB_bytes
+        # GiB = lambda b: b / GiB_bytes
+
+        # if torch.distributed.get_rank() == 0:
+        #     torch_memory = torch.npu.memory_reserved()
+        #     torch_peak = torch.npu.memory_stats().get("allocated_bytes.all.peak", 0)
+        #     free_memory, total_memory = torch.npu.mem_get_info()
+        #     non_torch_memory = total_memory - free_memory - torch_memory
+
+        #     if non_torch_memory > self.non_torch_memory:
+        #         print("-" * 100)
+        #         print(self.step_cnt)
+        #         self.non_torch_memory = non_torch_memory
+
+        #         logger.info("start model runner forward:")
+        #         # logger.info("total_memory: %.2f G", GiB(total_memory))
+        #         # logger.info("request_memory: %.2f G", GiB(total_memory * 0.95))
+        #         # logger.info("torch_memory: %.2f G", GiB(torch_memory))
+        #         # logger.info("torch_memory_peak: %.2f G", GiB(torch_peak))
+        #         logger.info("non_torch_memory: %.2f G", GiB(non_torch_memory))
+        ########################################################################
+
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called "
                                "after execute_model() returns None.")
@@ -1469,6 +1569,27 @@ class NPUModelRunner(GPUModelRunner):
 
             if self.dynamic_eplb:
                 self.eplb_updator.take_update_info_from_eplb_process()
+
+        ########################################################################
+        # if torch.distributed.get_rank() == 0:
+        #     torch_memory = torch.npu.memory_reserved()
+        #     torch_peak = torch.npu.memory_stats().get("allocated_bytes.all.peak", 0)
+        #     free_memory, total_memory = torch.npu.mem_get_info()
+        #     non_torch_memory = total_memory - free_memory - torch_memory
+
+        #     if non_torch_memory > self.non_torch_memory:
+        #         print("-" * 100)
+        #         print(self.step_cnt)
+        #         self.non_torch_memory = non_torch_memory
+
+        #         print("-" * 100)
+        #         logger.info("after prepare input:")
+        #         # logger.info("total_memory: %.2f G", GiB(total_memory))
+        #         # logger.info("request_memory: %.2f G", GiB(total_memory * 0.95))
+        #         # logger.info("torch_memory: %.2f G", GiB(torch_memory))
+        #         # logger.info("torch_memory_peak: %.2f G", GiB(torch_peak))
+        #         logger.info("non_torch_memory: %.2f G", GiB(non_torch_memory))
+        ########################################################################
 
         # prevent debugger is None
         if self.debugger is not None:
@@ -1519,6 +1640,27 @@ class NPUModelRunner(GPUModelRunner):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = hidden_states
+
+        ########################################################################
+        # if torch.distributed.get_rank() == 0:
+        #     torch_memory = torch.npu.memory_reserved()
+        #     torch_peak = torch.npu.memory_stats().get("allocated_bytes.all.peak", 0)
+        #     free_memory, total_memory = torch.npu.mem_get_info()
+        #     non_torch_memory = total_memory - free_memory - torch_memory
+
+        #     if non_torch_memory > self.non_torch_memory:
+        #         print("-" * 100)
+        #         print(self.step_cnt)
+        #         self.non_torch_memory = non_torch_memory
+
+        #         print("-" * 100)
+        #         logger.info("after LLM forward:")
+        #         # logger.info("total_memory: %.2f G", GiB(total_memory))
+        #         # logger.info("request_memory: %.2f G", GiB(total_memory * 0.95))
+        #         # logger.info("torch_memory: %.2f G", GiB(torch_memory))
+        #         # logger.info("torch_memory_peak: %.2f G", GiB(torch_peak))
+        #         logger.info("non_torch_memory: %.2f G", GiB(non_torch_memory))
+        ########################################################################
 
         kv_connector_output = KVConnectorOutput(
             finished_sending=finished_sending,
@@ -1586,6 +1728,29 @@ class NPUModelRunner(GPUModelRunner):
                 positions,
             )
             self.kv_connector_output = kv_connector_output
+
+        ########################################################################
+        # if torch.distributed.get_rank() == 0:
+        #     torch_memory = torch.npu.memory_reserved()
+        #     torch_peak = torch.npu.memory_stats().get("allocated_bytes.all.peak", 0)
+        #     free_memory, total_memory = torch.npu.mem_get_info()
+        #     non_torch_memory = total_memory - free_memory - torch_memory
+
+        #     if non_torch_memory > self.non_torch_memory:
+        #         print("-" * 100)
+        #         print(self.step_cnt)
+        #         self.non_torch_memory = non_torch_memory
+
+        #         print("-" * 100)
+        #         logger.info("after post process:")
+        #         # logger.info("total_memory: %.2f G", GiB(total_memory))
+        #         # logger.info("request_memory: %.2f G", GiB(total_memory * 0.95))
+        #         # logger.info("torch_memory: %.2f G", GiB(torch_memory))
+        #         # logger.info("torch_memory_peak: %.2f G", GiB(torch_peak))
+        #         logger.info("non_torch_memory: %.2f G", GiB(non_torch_memory))
+        #         print("-" * 100)
+        ########################################################################
+
         return None
 
     @torch.inference_mode
@@ -2002,11 +2167,12 @@ class NPUModelRunner(GPUModelRunner):
 
     def _generate_dummy_run_hidden_states(self, input_ids, positions,
                                           num_tokens, intermediate_tensors,
-                                          inputs_embeds):
+                                          inputs_embeds, model_kwargs):
         hidden_states = self.model(input_ids=input_ids,
                                    positions=positions,
                                    intermediate_tensors=intermediate_tensors,
-                                   inputs_embeds=inputs_embeds)
+                                   inputs_embeds=inputs_embeds,
+                                   **model_kwargs)
         forward_context = get_forward_context()
         assert forward_context is not None
         if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and \
@@ -2156,9 +2322,16 @@ class NPUModelRunner(GPUModelRunner):
                                             num_sampled_tokens):
             # Make sure padding doesn't exceed max_num_tokens
             assert num_tokens_padded <= self.max_num_tokens
-            if self.is_multimodal_model:
+            model_kwargs = self._init_model_kwargs(num_tokens_padded)
+            if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
+                print(f"[dummy run] num_tokens_padded: {num_tokens_padded}")
+
                 input_ids = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
+                model_kwargs = {
+                    **model_kwargs,
+                    **self._dummy_mm_kwargs(num_reqs),
+                }
             elif self.enable_prompt_embeds:
                 input_ids = None
                 inputs_embeds = self.inputs_embeds.gpu[:num_tokens_padded]
@@ -2227,7 +2400,7 @@ class NPUModelRunner(GPUModelRunner):
                     model_instance=self.model):
                 hidden_states = self._generate_dummy_run_hidden_states(
                     input_ids, positions, num_tokens_padded,
-                    intermediate_tensors, inputs_embeds)
+                    intermediate_tensors, inputs_embeds, model_kwargs)
                 dummy_compute_logits(hidden_states)
 
             if self.drafter:
@@ -2316,6 +2489,7 @@ class NPUModelRunner(GPUModelRunner):
             if self.lora_config:
                 self.model = self.load_lora_model(self.model, self.vllm_config,
                                                   self.device)
+        self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB",
                     m.consumed_memory / float(2**30))
 

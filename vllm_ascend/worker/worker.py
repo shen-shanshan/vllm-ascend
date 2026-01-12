@@ -18,6 +18,7 @@
 #
 
 import copy
+import gc
 from types import NoneType
 from typing import Optional
 
@@ -57,7 +58,7 @@ from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import (AscendDeviceType, check_ascend_device_type,
                                enable_sp, get_ascend_device_type,
-                               register_ascend_customop)
+                               npu_memory_profiling, register_ascend_customop)
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 torch._dynamo.trace_rules.clear_lru_cache()  # noqa: E402
@@ -140,6 +141,8 @@ class NPUWorker(WorkerBase):
 
         self.use_v2_model_runner = envs_vllm.VLLM_USE_V2_MODEL_RUNNER
 
+        self.step_cnt = 0
+
     def sleep(self, level: int = 1) -> None:
         free_bytes_before_sleep = NPUPlatform.mem_get_info()[0]
         # Save the buffers before level 2 sleep
@@ -221,12 +224,67 @@ class NPUWorker(WorkerBase):
                 f"({visible_device_count}).")
 
         self.init_npu_memory = NPUPlatform.mem_get_info()[0]
+
+        ########################################################################
+        GiB = lambda b: b / GiB_bytes
+
+        # torch_memory = torch.npu.memory_reserved()
+        # torch_peak = torch.npu.memory_stats().get("allocated_bytes.all.peak", 0)
+        # free_memory, total_memory = torch.npu.mem_get_info()
+        # non_torch_memory = total_memory - free_memory - torch_memory
+
+        # print("-"*100)
+        # logger.info("torch_memory before init HCCL is %.2f G", GiB(torch_memory))
+        # logger.info("torch_peak before init HCCL is %.2f G", GiB(torch_peak))
+        # logger.info("non_torch_memory before init HCCL is %.2f G", GiB(non_torch_memory))
+        # print("-"*100)
+        ########################################################################
+
         # Initialize the distributed environment.
         self._init_worker_distributed_environment()
+
         # Set random seed.
         NPUPlatform.seed_everything(self.model_config.seed)
         # Initialize device properties used by triton kernels.
         init_device_properties_triton()
+
+        # Now take memory snapshot after NCCL is initialized
+        # gc.collect()
+        # torch.npu.empty_cache()
+        # self.init_snapshot = NPUMemorySnapshot()
+        # self.requested_memory = (
+        #     self.init_snapshot.total_memory
+        #     * self.cache_config.gpu_memory_utilization
+        # )
+        # if self.init_snapshot.free_memory < self.requested_memory:
+        #     GiB = lambda b: round(b / GiB_bytes, 2)
+        #     raise ValueError(
+        #         f"Free memory on device "
+        #         f"({GiB(self.init_snapshot.free_memory)}/"
+        #         f"{GiB(self.init_snapshot.total_memory)} GiB) on startup "
+        #         f"is less than desired GPU memory utilization "
+        #         f"({self.cache_config.gpu_memory_utilization}, "
+        #         f"{GiB(self.requested_memory)} GiB). Decrease GPU memory "
+        #         f"utilization or reduce GPU memory used by other processes."
+        #     )
+
+        ########################################################################
+        torch_memory = torch.npu.memory_reserved()
+        torch_peak = torch.npu.memory_stats().get("allocated_bytes.all.peak",
+                                                  0)
+        free_memory, total_memory = torch.npu.mem_get_info()
+        non_torch_memory = total_memory - free_memory - torch_memory
+        if torch.distributed.get_rank() == 0:
+            print("-" * 100)
+            logger.info("torch_memory after init HCCL is %.2f G",
+                        GiB(torch_memory))
+            logger.info("torch_peak after init HCCL is %.2f G",
+                        GiB(torch_peak))
+            logger.info("non_torch_memory after init HCCL is %.2f G",
+                        GiB(non_torch_memory))
+            print("-" * 100)
+        ########################################################################
+
         return device
 
     def init_device(self):
@@ -250,6 +308,26 @@ class NPUWorker(WorkerBase):
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
+        ########################################################################
+        GiB = lambda b: b / GiB_bytes
+
+        torch_memory = torch.npu.memory_reserved()
+        torch_peak = torch.npu.memory_stats().get("allocated_bytes.all.peak",
+                                                  0)
+        free_memory, total_memory = torch.npu.mem_get_info()
+        non_torch_memory = total_memory - free_memory - torch_memory
+
+        if torch.distributed.get_rank() == 0:
+            print("-" * 100)
+            logger.info("torch_memory before profiling is %.2f G",
+                        GiB(torch_memory))
+            logger.info("torch_peak before profiling is %.2f G",
+                        GiB(torch_peak))
+            logger.info("non_torch_memory before profiling is %.2f G",
+                        GiB(non_torch_memory))
+            print("-" * 100)
+        ########################################################################
+
         # Profile the memory usage of the model and get the maximum number of
         # cache blocks that can be allocated with the remaining free memory.
         NPUPlatform.clear_npu_memory()
@@ -280,6 +358,33 @@ class NPUWorker(WorkerBase):
         total_allocated_bytes = torch_npu.npu.mem_get_info(
         )[1] - torch_npu.npu.mem_get_info()[0]
         non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
+
+        ########################################################################
+        GiB = lambda b: b / GiB_bytes
+
+        torch_memory = torch.npu.memory_reserved()
+        torch_peak = torch.npu.memory_stats().get("allocated_bytes.all.peak",
+                                                  0)
+        free_memory, total_memory = torch.npu.mem_get_info()
+        non_torch_memory = total_memory - free_memory - torch_memory
+
+        if torch.distributed.get_rank() == 0:
+            print("-" * 100)
+            logger.info("torch_memory after profiling is %.2f G",
+                        GiB(torch_memory))
+            logger.info("torch_peak after profiling is %.2f G",
+                        GiB(torch_peak))
+            logger.info("non_torch_memory after profiling is %.2f G",
+                        GiB(non_torch_memory))
+            print("-" * 100)
+            logger.info("results of real profiling:")
+            logger.info("peak_memory after profiling is %.2f G",
+                        GiB(peak_memory))
+            logger.info("non_torch_memory after profiling is %.2f G",
+                        GiB(non_torch_allocations))
+            print("-" * 100)
+        ########################################################################
+
         if non_torch_allocations > 0:
             peak_memory += non_torch_allocations
         available_kv_cache_memory = int(
@@ -287,9 +392,96 @@ class NPUWorker(WorkerBase):
             peak_memory)
         available_kv_cache_memory = int(max(available_kv_cache_memory, 0))
         logger.info(
-            f"Available memory: {available_kv_cache_memory}, total memory: {total_npu_memory}"
+            "Available memory: %.2f GiB, requested memory: %.2f GiB",
+            GiB(available_kv_cache_memory),
+            GiB(total_npu_memory * self.cache_config.gpu_memory_utilization),
         )
+
         return available_kv_cache_memory
+
+    @torch.inference_mode()
+    def determine_available_memory_new(self) -> int:
+        """Profiles the peak memory usage of the model to determine how much
+        memory can be used for KV cache without OOMs.
+
+        The engine will first conduct a profiling of the existing memory usage.
+        Then, it calculates the free memory that can be used for KV cache in
+        bytes.
+
+        Tip:
+            You may limit the usage of GPU memory
+            by adjusting the `gpu_memory_utilization` parameter.
+        """
+        GiB = lambda b: b / GiB_bytes
+        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+            # still need a profile run which compiles the model for
+            # max_num_batched_tokens
+            self.model_runner.profile_run()
+
+            msg = (
+                f"Initial free memory {GiB(self.init_snapshot.free_memory):.2f} "
+                f"GiB, reserved {GiB(kv_cache_memory_bytes):.2f} GiB memory for "
+                "KV Cache as specified by kv_cache_memory_bytes config and "
+                "skipped memory profiling. This does not respect the "
+                "gpu_memory_utilization config. Only use kv_cache_memory_bytes "
+                "config when you want manual control of KV cache memory "
+                "size. If OOM'ed, check the difference of initial free "
+                "memory between the current run and the previous run "
+                "where kv_cache_memory_bytes is suggested and update it "
+                "correspondingly.")
+            logger.info(msg)
+            return kv_cache_memory_bytes
+
+        torch.npu.empty_cache()
+        torch.npu.reset_peak_memory_stats()
+
+        # Execute a forward pass with dummy inputs to profile the memory usage
+        # of the model.
+        with npu_memory_profiling(
+                self.init_snapshot,
+                weights_memory=int(self.model_runner.model_memory_usage),
+        ) as profile_result:
+            self.model_runner.profile_run()
+
+        self.non_torch_memory = profile_result.non_torch_increase
+        self.peak_activation_memory = profile_result.torch_peak_increase
+
+        free_gpu_memory = profile_result.after_profile.free_memory
+        # NOTE(woosuk): Here we assume that the other processes using the same
+        # GPU did not change their memory usage during the profiling.
+        assert self.init_snapshot.free_memory > free_gpu_memory, (
+            "Error in memory profiling. "
+            f"Initial free memory {GiB(self.init_snapshot.free_memory)} GiB, "
+            f"current free memory {GiB(free_gpu_memory)} GiB. "
+            "This happens when other processes sharing the same container "
+            "release GPU memory while vLLM is profiling during initialization. "
+            "To fix this, ensure consistent GPU memory allocation or "
+            "isolate vLLM in its own container.")
+        self.available_kv_cache_memory_bytes = (
+            self.requested_memory - profile_result.non_kv_cache_memory)
+
+        unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
+        logger.info(
+            "Initial free memory: %.2f GiB; Requested memory: %.2f (util), %.2f GiB",
+            GiB(self.init_snapshot.free_memory),
+            self.cache_config.gpu_memory_utilization,
+            GiB(self.requested_memory),
+        )
+        logger.info(
+            "Free memory after profiling: %.2f GiB (total), "
+            "%.2f GiB (within requested)",
+            GiB(free_gpu_memory),
+            GiB(free_gpu_memory - unrequested_memory),
+        )
+        logger.info(profile_result)
+        logger.info_once(
+            "Available KV cache memory: %.2f GiB",
+            GiB(self.available_kv_cache_memory_bytes),
+            scope="local",
+        )
+        gc.collect()
+
+        return int(self.available_kv_cache_memory_bytes)
 
     def execute_model(
         self,
@@ -311,8 +503,58 @@ class NPUWorker(WorkerBase):
                 get_pp_group().recv_tensor_dict(
                     all_gather_group=all_gather_group))
 
+        ########################################################################
+        # self.step_cnt +=1
+        # if torch.distributed.get_rank() == 0:
+        #     if self.step_cnt > 0:
+        #         print(f"step_cnt: {self.step_cnt}")
+        #         GiB = lambda b: b / GiB_bytes
+
+        #         torch_memory = torch.npu.memory_reserved()
+        #         torch_peak = torch.npu.memory_stats().get("allocated_bytes.all.peak", 0)
+        #         free_memory, total_memory = torch.npu.mem_get_info()
+        #         non_torch_memory = total_memory - free_memory - torch_memory
+        #         # device_memory = torch.npu.device_memory_used("npu:0")
+        #         # memory_summary = torch.npu.memory_summary()
+
+        #         print("#"*100)
+        #         logger.info("before model_runner.execute_model:")
+        #         # logger.info("total_memory: %.2f G", GiB(total_memory))
+        #         # logger.info("request_memory: %.2f G", GiB(total_memory * 0.95))
+        #         # logger.info("torch_memory: %.2f G", GiB(torch_memory))
+        #         # logger.info("torch_memory_peak: %.2f G", GiB(torch_peak))
+        #         logger.info("non_torch_memory: %.2f G", GiB(non_torch_memory))
+        #         # logger.info("device_memory: %.2f G", GiB(device_memory))
+        #         # print(memory_summary)
+        ########################################################################
+
         output = self.model_runner.execute_model(scheduler_output,
                                                  intermediate_tensors)
+
+        ########################################################################
+        # if torch.distributed.get_rank() == 0:
+        #     if self.step_cnt > 0:
+        #         GiB = lambda b: b / GiB_bytes
+
+        #         torch_memory = torch.npu.memory_reserved()
+        #         torch_peak = torch.npu.memory_stats().get("allocated_bytes.all.peak", 0)
+        #         free_memory, total_memory = torch.npu.mem_get_info()
+        #         non_torch_memory = total_memory - free_memory - torch_memory
+        #         # device_memory = torch.npu.device_memory_used("npu:0")
+        #         # memory_summary = torch.npu.memory_summary()
+
+        #         # print("#"*100)
+        #         logger.info("after model_runner.execute_model:")
+        #         # logger.info("total_memory: %.2f G", GiB(total_memory))
+        #         # logger.info("request_memory: %.2f G", GiB(total_memory * 0.95))
+        #         # logger.info("torch_memory: %.2f G", GiB(torch_memory))
+        #         # logger.info("torch_memory_peak: %.2f G", GiB(torch_peak))
+        #         logger.info("non_torch_memory: %.2f G", GiB(non_torch_memory))
+        #         # logger.info("device_memory: %.2f G", GiB(device_memory))
+        #         # print(memory_summary)
+        #         print("#"*100)
+        ########################################################################
+
         if isinstance(output, (ModelRunnerOutput, NoneType)):
             return output
 

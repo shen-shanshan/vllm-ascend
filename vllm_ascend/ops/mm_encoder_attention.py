@@ -30,6 +30,8 @@ MAX_PAD_SIZE = 128  # max_size to pad weight
 
 class AscendMMEncoderAttention(MMEncoderAttention):
 
+    global_non_torch_memory = 0
+
     def __init__(
         self,
         num_heads: int,
@@ -119,6 +121,7 @@ class AscendMMEncoderAttention(MMEncoderAttention):
                                       device=query.device)
 
         cu_seqlens = torch.diff(cu_seqlens).to("cpu")
+        # cu_seqlens = cu_seqlens.cpu().tolist()
 
         # operator requires pta version >= 2.5.1
         torch_npu._npu_flash_attention_unpad(
@@ -131,6 +134,17 @@ class AscendMMEncoderAttention(MMEncoderAttention):
             num_kv_heads=self.num_kv_heads,
             out=context_layer,
         )
+
+        # context_layer = torch_npu.npu_fusion_attention(
+        #     query=q,
+        #     key=k,
+        #     value=v,
+        #     head_num=self.num_heads,
+        #     input_layout="TND",
+        #     scale=self.head_size**-0.5,
+        #     actual_seq_qlen=cu_seqlens,
+        #     actual_seq_kvlen=cu_seqlens,
+        # )[0]
 
         if enable_pad:
             context_layer = context_layer[..., :origin_shape]

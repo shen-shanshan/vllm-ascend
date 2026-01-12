@@ -19,22 +19,31 @@
 
 import atexit
 import functools
+import gc
 import math
 import os
+import time
+from collections.abc import Generator
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, field
 from enum import Enum
 from threading import Lock
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
+import psutil
 import torch
+import torch.types
 import torch_npu  # noqa: F401
 from packaging.version import InvalidVersion, Version
 from torch_npu.npu.streams import Event
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
+from vllm.utils.mem_constants import GiB_bytes
 
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import WeightPrefetchConfig, get_ascend_config
+
+# from vllm.utils.mem_utils import NPUMemoryProfilingResult
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -1132,3 +1141,238 @@ def check_kv_extra_config(vllm_config):
         _check(
             "decode",
             vllm_config.kv_transfer_config.get_from_extra_config("decode", {}))
+
+
+@dataclass
+class NPUMemorySnapshot:
+    """NPU Memory snapshot."""
+
+    torch_peak: int = 0
+    free_memory: int = 0
+    total_memory: int = 0
+    cuda_memory: int = 0
+    torch_memory: int = 0
+    non_torch_memory: int = 0
+    timestamp: float = 0.0
+    auto_measure: bool = True
+
+    def __post_init__(self) -> None:
+        if self.auto_measure:
+            self.measure()
+
+    def measure(self) -> None:
+        from vllm.platforms import current_platform
+
+        # we measure the torch peak memory usage via allocated_bytes,
+        # rather than `torch.npu.memory_reserved()` .
+        # After `torch.npu.reset_peak_memory_stats()`,
+        # `torch.npu.memory_reserved()` will keep growing, and only shrink
+        # when we call `torch.npu.empty_cache()` or OOM happens.
+        self.torch_peak = torch.npu.memory_stats().get(
+            "allocated_bytes.all.peak", 0)
+
+        self.free_memory, self.total_memory = torch.npu.mem_get_info()
+        shared_sysmem_device_mem_sms = (
+            (8, 7), (11, 0), (12, 1))  # Orin, Thor, Spark
+        if (current_platform.is_cuda()
+                and current_platform.get_device_capability()
+                in shared_sysmem_device_mem_sms):
+            # On UMA (Orin, Thor and Spark) platform,
+            # where both CPU and NPU rely on system memory,
+            # the cudaMemGetInfo function shows the amount of free system memory
+            # rather than what’s actually available.
+            # In the case,
+            # torch.npu.mem_get_info() only reports "free" memory,
+            # which can be lower than what is actually
+            # available due to not including cache memory.
+            # There’s also a comprehensive reference page
+            # that explains how you can compute the proper value yourself.
+            # https://docs.nvidia.com/cuda/cuda-for-tegra-appnote/#estimating-total-allocatable-device-memory-on-an-integrated-gpu-device
+            self.free_memory = psutil.virtual_memory().available
+
+        self.cuda_memory = self.total_memory - self.free_memory
+
+        # torch.npu.memory_reserved() is how many bytes
+        # PyTorch gets from cuda (by calling cudaMalloc, etc.)
+        # this is used to measure the non-torch memory usage
+        self.torch_memory = torch.npu.memory_reserved()
+
+        self.non_torch_memory = self.cuda_memory - self.torch_memory
+        self.timestamp = time.time()
+
+    def __sub__(self, other: "NPUMemorySnapshot") -> "NPUMemorySnapshot":
+        return NPUMemorySnapshot(
+            torch_peak=self.torch_peak - other.torch_peak,
+            free_memory=self.free_memory - other.free_memory,
+            total_memory=self.total_memory - other.total_memory,
+            cuda_memory=self.cuda_memory - other.cuda_memory,
+            torch_memory=self.torch_memory - other.torch_memory,
+            non_torch_memory=self.non_torch_memory - other.non_torch_memory,
+            timestamp=self.timestamp - other.timestamp,
+            auto_measure=False,
+        )
+
+
+@dataclass
+class NPUMemoryProfilingResult:
+    """Memory profiling result. All numbers are in bytes."""
+
+    non_kv_cache_memory: int = 0
+    torch_peak_increase: int = 0
+    non_torch_increase: int = 0
+    weights_memory: float = 0
+    before_create: NPUMemorySnapshot = field(default_factory=NPUMemorySnapshot)
+    before_profile: NPUMemorySnapshot = field(
+        default_factory=NPUMemorySnapshot)
+    after_profile: NPUMemorySnapshot = field(default_factory=NPUMemorySnapshot)
+    profile_time: float = 0.0
+
+    def __repr__(self) -> str:
+        return (
+            f"Memory profiling takes {self.profile_time:.2f} seconds. "
+            f"Total non KV cache memory: "
+            f"{(self.non_kv_cache_memory / GiB_bytes):.2f} GiB; "
+            f"torch peak memory increase: "
+            f"{(self.torch_peak_increase / GiB_bytes):.2f} GiB; "
+            f"non-torch forward increase memory: "
+            f"{(self.non_torch_increase / GiB_bytes):.2f} GiB; "
+            f"weights memory: {(self.weights_memory / GiB_bytes):.2f} GiB.")
+
+
+@contextmanager
+def npu_memory_profiling(
+        baseline_snapshot: NPUMemorySnapshot, weights_memory: int
+) -> Generator[NPUMemoryProfilingResult, None, None]:
+    """Memory profiling context manager.
+    baseline_snapshot: the memory snapshot before the current vLLM instance.
+    weights_memory: memory used by PyTorch when loading the model weights.
+        Note that, before loading the model weights, we also initialize the device
+        and distributed environment, which may consume some memory. This part is not
+        included in the weights_memory because PyTorch does not control it.
+
+    The memory in one NPU can be classified into 3 categories:
+    1. memory used by anything other than the current vLLM instance.
+    2. memory used by torch in the current vLLM instance.
+    3. memory used in the current vLLM instance, but not by torch.
+
+    A quantitive example:
+
+    Before creating the current vLLM instance:
+        category 1: 1 GiB
+        category 2: 0 GiB
+        category 3: 0 GiB
+
+    After creating the current vLLM instance and loading the model,
+    (i.e. before profiling):
+        category 1: 1 GiB
+        category 2: 2 GiB (model weights take 2 GiB)
+        category 3: 0.5 GiB (memory used by NCCL)
+
+    During profiling (peak):
+        category 1: 1 GiB
+        category 2: 4 GiB (peak activation tensors take 2 GiB)
+        category 3: 1 GiB (memory used by NCCL + buffers for some attention backends)
+
+    After profiling:
+        category 1: 1 GiB
+        category 2: 3 GiB (after garbage-collecting activation tensors)
+        category 3: 1 GiB (memory used by NCCL + buffers for some attention backends)
+
+    In this case, non-kv cache takes 5 GiB in total, including:
+    a. 2 GiB used by the model weights (category 2)
+    b. 2 GiB reserved for the peak activation tensors (category 2)
+    c. 1 GiB used by non-torch components (category 3)
+
+    The memory used for loading weights (a.) is directly given from the argument `weights_memory`.
+
+    The increase of `torch.npu.memory_stats()["allocated_bytes.all.peak"]` during profiling gives (b.).
+
+    The increase of `non_torch_memory` from creating the current vLLM instance until after profiling to get (c.).
+    """  # noqa
+    gc.collect()
+    torch.npu.empty_cache()
+    torch.npu.reset_peak_memory_stats()
+
+    result = NPUMemoryProfilingResult()
+
+    result.before_create = baseline_snapshot
+    # the part of memory used for holding the model weights
+    result.weights_memory = weights_memory
+
+    result.before_profile.measure()
+
+    GiB = lambda b: b / GiB_bytes
+    torch_memory = torch.npu.memory_reserved()
+    torch_peak = torch.npu.memory_stats().get("allocated_bytes.all.peak", 0)
+    free_memory, total_memory = torch.npu.mem_get_info()
+    non_torch_memory = total_memory - free_memory - torch_memory
+    if torch.distributed.get_rank() == 0:
+        print("-" * 100)
+        logger.info("torch_memory before profiling is %.2f G",
+                    GiB(torch_memory))  # 9.75 G
+        logger.info("torch_peak before profiling is %.2f G",
+                    GiB(torch_peak))  # 9.45 G
+        logger.info("non_torch_memory before profiling is %.2f G",
+                    GiB(non_torch_memory))
+
+    yield result
+
+    torch_memory = torch.npu.memory_reserved()
+    torch_peak = torch.npu.memory_stats().get("allocated_bytes.all.peak", 0)
+    free_memory, total_memory = torch.npu.mem_get_info()
+    non_torch_memory = total_memory - free_memory - torch_memory
+    if torch.distributed.get_rank() == 0:
+        print("-" * 100)
+        logger.info(
+            "torch_memory after profiling, before empty_cache() is %.2f G",
+            GiB(torch_memory))  # 19.13 G
+        logger.info(
+            "torch_peak after profiling, before empty_cache() is %.2f G",
+            GiB(torch_peak))  # 13.30 G
+        logger.info(
+            "non_torch_memory after profiling, before empty_cache() is %.2f G",
+            GiB(non_torch_memory))
+    non_torch_memory_peak = non_torch_memory
+
+    gc.collect()
+    torch.npu.empty_cache()
+
+    time.sleep(3)
+    torch_memory = torch.npu.memory_reserved()
+    torch_peak = torch.npu.memory_stats().get("allocated_bytes.all.peak", 0)
+    free_memory, total_memory = torch.npu.mem_get_info()
+    non_torch_memory = total_memory - free_memory - torch_memory
+    if torch.distributed.get_rank() == 0:
+        print("-" * 100)
+        logger.info(
+            "torch_memory after profiling, after empty_cache() is %.2f G",
+            GiB(torch_memory))  # 9.75 G
+        logger.info(
+            "torch_peak after profiling, after empty_cache() is %.2f G",
+            GiB(torch_peak))  # 13.30 G
+        logger.info(
+            "non_torch_memory after profiling, after empty_cache() is %.2f G",
+            GiB(non_torch_memory))
+
+    result.after_profile.measure()
+
+    diff_profile = result.after_profile - result.before_profile
+    diff_from_create = result.after_profile - result.before_create
+    result.torch_peak_increase = diff_profile.torch_peak
+    result.non_torch_increase = diff_from_create.non_torch_memory
+    result.profile_time = diff_profile.timestamp
+
+    # non_torch_memory = result.non_torch_increase
+    non_torch_memory = non_torch_memory_peak
+    if torch.distributed.get_rank() == 0:
+        logger.info("new non_torch_memory is %.2f G",
+                    GiB(non_torch_memory))  # 4.14 G
+
+    # peak_activation_memory = result.torch_peak_increase
+    peak_activation_memory = torch_peak - weights_memory
+    if torch.distributed.get_rank() == 0:
+        logger.info("new peak_activation_memory is %.2f G",
+                    GiB(peak_activation_memory))  # 4.14 G
+
+    result.non_kv_cache_memory = (non_torch_memory + peak_activation_memory +
+                                  result.weights_memory)  # noqa
